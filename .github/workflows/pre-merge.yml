@@ -27,6 +27,8 @@ jobs:
     permissions:
       contents: read
     steps:
+    - name: Delete huge unnecessary tools folder
+      run: rm -rf /opt/hostedtoolcache
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
     - uses: pre-commit/action@v3.0.0

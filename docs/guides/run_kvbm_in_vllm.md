@@ -43,6 +43,12 @@ export DYN_KVBM_CPU_CACHE_GB=4
 # 8 means 8GB of disk would be used
 export DYN_KVBM_DISK_CACHE_GB=8
 
+# Storage location
+#
+# *Optionally* set a path of a network storage location, e.g. NFS. # If this is
+not specified, the default is to store under `/tmp`.
+export DYN_KVBM_DISK_CACHE_DIR=/mnt/nfs
+
 # serve an example LLM model
 vllm serve --kv-transfer-config '{"kv_connector":"DynamoConnector","kv_role":"kv_both", "kv_connector_module_path": "dynamo.llm.vllm_integration.connector"}' deepseek-ai/DeepSeek-R1-Distill-Llama-8B
 

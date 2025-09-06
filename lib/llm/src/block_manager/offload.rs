@@ -357,6 +357,7 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
         let target_pool = target_pool.as_ref().unwrap();
 
         let mut queue = BTreeSet::new();
+        let mut req_blocks_to_offload = vec![];
 
         loop {
             if cancellation_token.is_cancelled() {
@@ -377,7 +378,9 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             }
 
             // If there is a request, process it.
-            if let Some(request) = queue.pop_first() {
+            while req_blocks_to_offload.len() < MAX_CONCURRENT_TRANSFERS
+                && let Some(request) = queue.pop_first()
+            {
                 // Try to upgrade the block to a strong reference.
                 let block = match request.block.upgrade() {
                     Some(block) => Some(ImmutableBlock::new(block)),
@@ -405,39 +408,39 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                         continue;
                     }
 
-                    let target_block = 'target_block: {
-                        if let Ok(blocks) = target_pool.allocate_blocks(1).await
-                            && let Some(block) = blocks.into_iter().next()
-                        {
-                            break 'target_block Some(block);
-                        }
+                    req_blocks_to_offload.push((block, request.sequence_hash));
+                }
+            }
 
-                        tracing::warn!(
-                            "Target pool full. Skipping offload. This should only ever happen with very small pool sizes."
-                        );
-                        None
-                    };
-
-                    if let Some(target_block) = target_block {
+            if req_blocks_to_offload.len() > 0 {
+                if let Ok(target_blocks) = target_pool
+                    .allocate_blocks(req_blocks_to_offload.len())
+                    .await
+                {
+                    for (_, sequence_hash) in req_blocks_to_offload.iter() {
                         tracing::debug!(
                             "Offloading block with sequence hash {} to target pool.",
-                            request.sequence_hash
+                            sequence_hash
                         );
 
                         // Track the offload metric if available
                         if let Some(ref metric) = offload_metric {
                             metric.inc();
                         }
-
-                        transfer_manager
-                            .enqueue_transfer(PendingTransfer::new(
-                                vec![block],
-                                vec![target_block],
-                                None,
-                                target_pool.clone(),
-                            ))
-                            .await?;
                     }
+
+                    transfer_manager
+                        .enqueue_transfer(PendingTransfer::new(
+                            req_blocks_to_offload.drain(..).map(|(x, _)| x).collect(),
+                            target_blocks,
+                            None,
+                            target_pool.clone(),
+                        ))
+                        .await?;
+                } else {
+                    tracing::warn!(
+                        "target pool full. skipping offload. this should only ever happen with very small pool sizes."
+                    );
                 }
             } else {
                 // Await the next request.
@@ -2523,14 +2526,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_offload_evict_order() -> Result<()> {
-        let (offload_manager, device_pool, host_pool, _) = build_pools(4, Some(4), None, None)?;
+        let num_blocks = 4 * MAX_CONCURRENT_TRANSFERS;
+        let (offload_manager, device_pool, host_pool, _) = build_pools(num_blocks, Some(num_blocks), None, None)?;
 
         let device_pool = device_pool.as_ref().unwrap();
         let host_pool = host_pool.as_ref().unwrap();
 
-        let tokens = vec![0_u32; BLOCK_SIZE * 4];
-        let token_blocks = TokenBlockSequence::new(Tokens::from(tokens), 4, None);
-        assert_eq!(token_blocks.blocks().len(), 4);
+        let tokens = vec![0_u32; BLOCK_SIZE * num_blocks];
+        let token_blocks = TokenBlockSequence::new(Tokens::from(tokens), BLOCK_SIZE as u32, None);
+        assert_eq!(token_blocks.blocks().len(), num_blocks);
 
         let mut mutable_blocks = Vec::new();
         let mut sequence_hashes = Vec::new();
@@ -2554,14 +2558,14 @@ mod tests {
         // Wait for offloads.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Allocate 2 blocks on the host.
-        let _host_blocks = host_pool.allocate_blocks(2).await?;
+        // Allocate MAX_CONCURRENT_TRANSFERS blocks on the host to trigger eviction.
+        let _host_blocks = host_pool.allocate_blocks(MAX_CONCURRENT_TRANSFERS).await?;
 
-        // The first two blocks should've been evicted.
-        // The last two blocks should still be on the host.
+        // The first MAX_CONCURRENT_TRANSFERS blocks should've been evicted.
+        // The remaining blocks should still be on the host.
         assert_eq!(
             host_pool
-                .match_sequence_hashes(sequence_hashes.as_slice())
+                .match_sequence_hashes(&sequence_hashes[..MAX_CONCURRENT_TRANSFERS])
                 .await?
                 .len(),
             0
@@ -2569,10 +2573,10 @@ mod tests {
 
         assert_eq!(
             host_pool
-                .match_sequence_hashes(&sequence_hashes[2..])
+                .match_sequence_hashes(&sequence_hashes[MAX_CONCURRENT_TRANSFERS..])
                 .await?
                 .len(),
-            2
+            num_blocks - MAX_CONCURRENT_TRANSFERS
         );
 
         Ok(())

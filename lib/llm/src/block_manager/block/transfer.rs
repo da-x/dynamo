@@ -9,6 +9,9 @@ mod strategy;
 
 use super::*;
 
+use crate::block_manager::block::{
+    BlockDataExt, BlockDataProvider, BlockDataProviderMut, BlockError, StorageTypeProvider,
+};
 use crate::block_manager::storage::{
     DeviceStorage, DiskStorage, PinnedStorage, SystemStorage,
     nixl::{NixlRegisterableStorage, NixlStorage},
@@ -242,6 +245,72 @@ where
             }
         }
         TransferStrategy::Nixl(transfer_type) => {
+            let src_contig = sources[0].block_data().is_fully_contiguous();
+            let target_contig = targets[0].block_data().is_fully_contiguous();
+            if src_contig != target_contig {
+                // This is done to avoid small NIXL transfers done directly from
+                // GPU to disk. We use temporary GPU buffers to rearrange layout to
+                // FullyContiguous on egress, and to redistribute to LayerSeparate
+                // on ingress.
+
+                tracing::debug!(
+                    "Using temporary GPU buffer for layout conversion: {} to {}",
+                    if src_contig {
+                        "contig source"
+                    } else {
+                        "non-contig source"
+                    },
+                    if target_contig {
+                        "contig target"
+                    } else {
+                        "non-contig target"
+                    },
+                );
+
+                // Use temporary GPU buffer and custom kernel to consolidate data
+                match ctx.acquire_temp_device_buffer() {
+                    Ok(temp_dest) => {
+                        let mut dest_slice = [temp_dest.data.to_owned()];
+                        match cuda::copy_blocks_with_customized_kernel(
+                            sources,
+                            &mut dest_slice,
+                            ctx.stream().as_ref(),
+                            &ctx,
+                        ) {
+                            Ok(_) => {
+                                let transfer_fut = nixl::write_blocks_to(
+                                    &[temp_dest.data.to_owned()],
+                                    targets,
+                                    &ctx,
+                                    transfer_type,
+                                )?;
+                                ctx.async_rt_handle().spawn(async move {
+                                    let temp_dest = temp_dest;
+                                    transfer_fut.await;
+                                    // temp_buffer will be automatically returned to pool when dropped
+                                    tx.send(()).unwrap();
+                                    drop(temp_dest);
+                                });
+                                return Ok(rx);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "CUDA consolidation failed: {}, falling back to direct transfer",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to acquire temporary GPU buffer: {}, falling back to direct transfer",
+                            e
+                        );
+                    }
+                }
+            }
+
+            // Use direct transfer for contiguous data or reads
             let transfer_fut = nixl::write_blocks_to(sources, targets, &ctx, transfer_type)?;
 
             ctx.async_rt_handle().spawn(async move {

@@ -579,6 +579,10 @@ impl KvbmWorker {
             max_transfer_batch_size: MAX_TRANSFER_BATCH_SIZE,
             num_outer_components: device_layout.config().outer_dim,
             num_layers: device_layout.config().num_layers,
+            temp_device_buffer_pool_size: 4, // Pool of 4 temporary buffers
+            page_size: device_layout.config().page_size,
+            inner_dim: device_layout.config().inner_dim,
+            dtype_width_bytes: device_layout.config().dtype_width_bytes,
         };
 
         let transfer_context = Arc::new(TransferContext::new(
@@ -590,6 +594,7 @@ impl KvbmWorker {
                 .unwrap(),
             Handle::current(),
             Some(pool_config),
+            crate::block_manager::config::should_bypass_cpu_cache(),
         ));
 
         // Build our device, host, and disk block lists.

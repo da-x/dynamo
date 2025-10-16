@@ -146,6 +146,10 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             max_transfer_batch_size: MAX_TRANSFER_BATCH_SIZE,
             num_outer_components: config.model_config.outer_dim,
             num_layers: config.model_config.num_layers,
+            temp_device_buffer_pool_size: 4,
+            page_size: config.model_config.page_size,
+            inner_dim: config.model_config.inner_dim,
+            dtype_width_bytes: config.model_config.dtype_width_bytes,
         };
 
         // We want cuda offloads to happen in parallel with host onboards, so we need to use a different stream.
@@ -154,6 +158,7 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             cuda_ctx.new_stream()?,
             config.async_rt_handle.clone(),
             Some(pool_config.clone()),
+            config.bypass_cpu_mem,
         ));
 
         let device_metrics = config.metrics.pool("device");
@@ -194,6 +199,7 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
             cuda_ctx.new_stream()?,
             config.async_rt_handle.clone(),
             Some(pool_config.clone()),
+            config.bypass_cpu_mem,
         ));
 
         // Host -> Disk offload

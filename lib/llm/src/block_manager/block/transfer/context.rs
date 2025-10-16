@@ -3,6 +3,12 @@
 
 use super::*;
 
+use crate::block_manager::LayoutConfig;
+use crate::block_manager::block::data::local::LocalBlockData;
+use crate::block_manager::layout::FullyContiguous;
+use crate::block_manager::storage::DeviceStorage;
+use crate::block_manager::storage::nixl::NixlRegisterableStorage;
+
 use cudarc::driver::{CudaEvent, CudaStream, sys::CUevent_flags};
 use nixl_sys::Agent as NixlAgent;
 
@@ -59,6 +65,19 @@ impl Drop for PinnedBuffer {
 }
 
 pub type SyncPinnedBufferPool = SyncPool<PinnedBuffer>;
+
+pub struct TempBlock {
+    pub data: LocalBlockData<DeviceStorage>,
+    pub idx: usize,
+}
+
+impl Returnable for TempBlock {
+    fn on_return(&mut self) {
+        tracing::debug!("Returning temp block #{} to pool", self.idx);
+    }
+}
+
+pub type SyncTempDevicePool = SyncPool<TempBlock>;
 
 pub struct TransferResources {
     src_buffer: SyncPoolItem<PinnedBuffer>,
@@ -164,10 +183,14 @@ impl Drop for TransferResources {
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     pub enable_pool: bool,
+    pub enable_temp_device_buffer_pool: bool,
     pub max_concurrent_transfers: usize,
     pub max_transfer_batch_size: usize,
     pub num_outer_components: usize,
     pub num_layers: usize,
+    pub page_size: usize,
+    pub inner_dim: usize,
+    pub dtype_width_bytes: usize,
 }
 
 pub struct TransferContext {
@@ -180,6 +203,8 @@ pub struct TransferContext {
 
     // LEGACY: Old pinned buffer pool (still used by TransferResources)
     pinned_buffer_pool: Option<SyncPinnedBufferPool>,
+
+    temp_device_buffer_pool: Option<SyncTempDevicePool>,
 
     cuda_event_tx: mpsc::UnboundedSender<(CudaEvent, oneshot::Sender<()>)>,
     cuda_event_worker: Option<JoinHandle<()>>,
@@ -201,10 +226,66 @@ impl TransferContext {
         let cancel_token_clone = cancel_token.clone();
         let cuda_event_worker = Self::setup_cuda_event_worker(cuda_event_rx, cancel_token_clone);
 
-        let pool = {
-            tracing::debug!(
-                "Pinned buffer pool is no longer used for kernel transfers and will be removed in the future"
-            );
+        let pool = if let Some(ref config) = config {
+            if config.enable_pool {
+                let pool_size = config.max_concurrent_transfers * 2 + 2;
+                // Calculate buffer size for worst-case scenario
+                let buffer_size = config.max_transfer_batch_size
+                    * config.num_outer_components
+                    * config.num_layers
+                    * std::mem::size_of::<u64>();
+
+                tracing::info!(
+                    "Creating pinned buffer pool: {} buffers × {}KB = {}MB total",
+                    pool_size,
+                    buffer_size / 1024,
+                    (pool_size * buffer_size) / (1024 * 1024)
+                );
+
+                let mut initial_buffers = Vec::with_capacity(pool_size);
+                for id in 0..pool_size {
+                    let ptr = unsafe {
+                        cudarc::driver::result::malloc_host(
+                            buffer_size,
+                            cudarc::driver::sys::CU_MEMHOSTALLOC_DEVICEMAP,
+                        )
+                        .map_err(|e| anyhow::anyhow!("Failed to allocate pinned memory: {}", e))?
+                    };
+
+                    // Initialize buffer to zero
+                    unsafe {
+                        std::ptr::write_bytes(ptr, 0, buffer_size);
+                    }
+
+                    initial_buffers.push(PinnedBuffer {
+                        ptr: ptr as u64,
+                        size: buffer_size,
+                        id: id as u64,
+                    });
+                }
+
+                Some(SyncPinnedBufferPool::new_direct(initial_buffers))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Create device buffer pool only when bypassing CPU memory (G1->G3 direct transfers)
+        let device_pool = if let Some(ref config) = config {
+            if config.enable_temp_device_buffer_pool {
+                tracing::debug!(
+                    "Creating temporary device buffer pool for G1->G3 layout conversions transfers"
+                );
+                Self::create_temp_device_buffer_pool(&stream, config, nixl_agent.clone())
+            } else {
+                tracing::debug!(
+                    "Temporary device buffer pool not needed - using CPU memory path (G1->G2->G3)"
+                );
+                None
+            }
+        } else {
             None
         };
 
@@ -251,10 +332,110 @@ impl TransferContext {
             async_rt_handle,
             cuda_mem_pool,
             pinned_buffer_pool: pool,
+            temp_device_buffer_pool: device_pool,
             cuda_event_tx,
             cuda_event_worker: Some(cuda_event_worker),
             cancel_token,
         })
+    }
+
+    fn create_temp_device_buffer_pool(
+        stream: &Arc<CudaStream>,
+        config: &PoolConfig,
+        nixl_agent: Arc<Option<nixl_sys::Agent>>,
+    ) -> Option<SyncTempDevicePool> {
+        let pool_size = config.max_concurrent_transfers * config.max_transfer_batch_size;
+        let Some(agent) = nixl_agent.as_ref() else {
+            return None;
+        };
+
+        let buffer_size = config.page_size
+            * config.num_layers
+            * config.num_outer_components
+            * config.inner_dim
+            * config.dtype_width_bytes;
+
+        tracing::info!(
+            "Creating temporary device buffer pool: {} MiB (calculated from layout: page_size={}, layers={}, outer={}, inner={}, dtype_bytes={})",
+            (pool_size * buffer_size) / (1024 * 1024),
+            config.page_size,
+            config.num_layers,
+            config.num_outer_components,
+            config.inner_dim,
+            config.dtype_width_bytes
+        );
+
+        let ctx = stream.context();
+        let _guard = ctx.bind_to_thread();
+
+        // Verify we're on the correct CUDA device
+        tracing::info!(
+            "CUDA context device: {}, binding to thread",
+            ctx.cu_device()
+        );
+
+        let mut initial_buffers = Vec::with_capacity(pool_size);
+
+        let mut storage = match DeviceStorage::new(ctx, buffer_size * pool_size) {
+            Ok(storage) => {
+                tracing::info!("Allocated device buffer");
+                storage
+            }
+            Err(e) => {
+                tracing::error!("Failed to allocate device buffer {}: {}", pool_size, e);
+                return None;
+            }
+        };
+
+        let layout_config = match LayoutConfig::builder()
+            .num_blocks(pool_size)
+            .num_layers(config.num_layers)
+            .outer_dim(config.num_outer_components)
+            .page_size(config.page_size)
+            .inner_dim(config.inner_dim)
+            .dtype_width_bytes(config.dtype_width_bytes)
+            .alignment(8) // alignment - use reasonable default
+            .build()
+            .map_err(|e| {
+                TransferError::ExecutionError(format!("Failed to create layout config: {}", e))
+            }) {
+            Ok(layout_config) => layout_config,
+            Err(e) => {
+                tracing::error!("Failed to create layout config: {}", e);
+                return None;
+            }
+        };
+
+        match storage.nixl_register(agent, None) {
+            Ok(()) => {
+                tracing::info!(
+                    "Successfully registered device buffer (0x{:x}) with NIXL",
+                    storage.addr()
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to register device buffer with NIXL: {}", e);
+                return None;
+            }
+        }
+
+        let layout = match FullyContiguous::new(layout_config, vec![storage]) {
+            Ok(layout) => layout,
+            Err(e) => {
+                tracing::error!("Failed to allocate layout: {}", e);
+                return None;
+            }
+        };
+
+        let layout_rc = Arc::new(layout);
+        for idx in 0..pool_size {
+            initial_buffers.push(TempBlock {
+                idx,
+                data: LocalBlockData::new(layout_rc.clone(), idx, 0, 0),
+            });
+        }
+
+        Some(SyncTempDevicePool::new_direct(initial_buffers))
     }
 
     fn setup_cuda_event_worker(
@@ -350,6 +531,18 @@ impl TransferContext {
             // No pool configured - this is a configuration error
             Err(TransferError::ExecutionError(
                 "No sync pool configured - TransferContext must be created with a pool".into(),
+            ))
+        }
+    }
+
+    /// Acquire a device buffer from the pool for layout conversion
+    pub fn acquire_temp_device_buffer(&self) -> Result<SyncPoolItem<TempBlock>, TransferError> {
+        if let Some(pool) = &self.temp_device_buffer_pool {
+            tracing::debug!("Device pool available - acquiring buffer (blocking)...");
+            Ok(pool.acquire_blocking())
+        } else {
+            Err(TransferError::ExecutionError(
+                "No device buffer pool configured - cannot use temporary buffer for layout conversion".into(),
             ))
         }
     }

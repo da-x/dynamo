@@ -147,10 +147,14 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
 
         let pool_config = PoolConfig {
             enable_pool: true,
+            enable_temp_device_buffer_pool: false,
             max_concurrent_transfers: MAX_CONCURRENT_TRANSFERS,
             max_transfer_batch_size: MAX_TRANSFER_BATCH_SIZE,
             num_outer_components: config.model_config.outer_dim,
             num_layers: config.model_config.num_layers,
+            page_size: config.model_config.page_size,
+            inner_dim: config.model_config.inner_dim,
+            dtype_width_bytes: config.model_config.dtype_width_bytes,
         };
 
         // We want cuda offloads to happen in parallel with host onboards, so we need to use a different stream.
@@ -207,7 +211,7 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                 config.nixl_agent.clone(),
                 cuda_ctx.new_stream()?,
                 config.async_rt_handle.clone(),
-                Some(pool_config),
+                Some(pool_config.clone()),
             )
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -216,6 +220,29 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                 )
             })?,
         );
+
+        // Device -> Disk direct offload transfer context (with temp device buffer pool for layout conversion)
+        let device_to_disk_transfer_ctx = if config.bypass_cpu_mem {
+            Some(Arc::new(
+                TransferContext::new(
+                    config.nixl_agent.clone(),
+                    cuda_ctx.new_stream()?,
+                    config.async_rt_handle.clone(),
+                    Some(PoolConfig {
+                        enable_temp_device_buffer_pool: true,
+                        ..pool_config.clone()
+                    }),
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to create transfer context for device->disk direct offload: {}",
+                        e
+                    )
+                })?,
+            ))
+        } else {
+            None
+        };
 
         // Host -> Disk offload
         let host_to_disk_task = OffloadManager::offload_worker(
@@ -306,13 +333,17 @@ impl<Locality: LocalityProvider + 'static, Metadata: BlockMetadata>
                 "G1->G3 direct offload enabled: Device will offload directly to Disk, bypassing Host memory (CPU cache disabled)"
             );
 
+            let device_to_disk_transfer_ctx = device_to_disk_transfer_ctx
+                .as_ref()
+                .expect("device_to_disk_transfer_ctx should be Some when bypass_cpu_mem is true");
+
             let device_to_disk_task = OffloadManager::offload_worker(
                 this.device.clone(),
                 this.disk.clone(),
                 device_to_disk_offload_rx,
                 Arc::new(TransferBatcher::new(
                     LocalTransferManager::new(
-                        transfer_ctx.clone(),
+                        device_to_disk_transfer_ctx.clone(),
                         MAX_CONCURRENT_TRANSFERS,
                         &config.async_rt_handle,
                         config.cancellation_token.clone(),

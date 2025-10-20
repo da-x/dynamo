@@ -245,9 +245,16 @@ where
             }
         }
         TransferStrategy::Nixl(transfer_type) => {
-            let src_contig = sources[0].block_data().is_fully_contiguous();
-            let target_contig = targets[0].block_data().is_fully_contiguous();
-            if src_contig != target_contig {
+            let src_block_type = sources[0].block_data();
+            let src_contig = src_block_type.is_fully_contiguous();
+            let src_disk = matches!(src_block_type.storage_type(), StorageType::Disk(_));
+            let target_block_type = targets[0].block_data();
+            let target_contig = target_block_type.is_fully_contiguous();
+            let target_disk = matches!(target_block_type.storage_type(), StorageType::Disk(_));
+
+            if (!src_contig && !src_disk && target_contig && target_disk)
+                || (src_contig && src_disk && !target_contig && !target_disk)
+            {
                 // This is done to avoid small NIXL transfers done directly from
                 // GPU to disk. We use temporary GPU buffers to rearrange layout to
                 // FullyContiguous on egress, and to redistribute to LayerSeparate

@@ -126,7 +126,8 @@ insta.opt-level = 3
 # release level optimizations otherwise everything feels slow
 # opt-level = 3
 
-[profile.release]
+[profile.release-lto]
+inherits = "release"
 # These make the build much slower but shrink the binary, and could help performance
 codegen-units = 1
 lto = "thin"

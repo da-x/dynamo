@@ -69,7 +69,7 @@ use derive_builder::Builder;
 use derive_getters::Getters;
 use dynamo_runtime::utils::task::CriticalTaskExecutionHandle;
 
-pub const MAX_CONCURRENT_TRANSFERS: usize = 4;
+pub const MAX_CONCURRENT_TRANSFERS: usize = 64;
 pub const MAX_TRANSFER_BATCH_SIZE: usize = 16;
 
 /// Configuration for creating an OffloadManager

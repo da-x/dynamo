@@ -220,7 +220,7 @@ impl<Source: Storage, Target: Storage, Locality: LocalityProvider, Metadata: Blo
         runtime: &Handle,
         cancellation_token: CancellationToken,
     ) -> Result<Self> {
-        let (futures_tx, mut futures_rx) = mpsc::channel(1);
+        let (futures_tx, mut futures_rx) = mpsc::channel(64);
 
         let mut completion_manager = TransferCompletionManager::new();
 

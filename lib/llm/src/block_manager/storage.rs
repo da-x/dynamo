@@ -324,6 +324,8 @@ impl Drop for RegistrationHandles {
 pub trait StorageAllocator<S: Storage>: Send + Sync {
     /// Allocate storage of the specific type `S` with the given size in bytes.
     fn allocate(&self, size: usize) -> Result<S, StorageError>;
+
+    fn get_storage_type(&self) -> StorageType;
 }
 
 /// System memory storage implementation using pinned memory
@@ -438,6 +440,10 @@ impl StorageAllocator<SystemStorage> for SystemAllocator {
     fn allocate(&self, size: usize) -> Result<SystemStorage, StorageError> {
         SystemStorage::new(size)
     }
+
+    fn get_storage_type(&self) -> StorageType {
+        StorageType::System
+    }
 }
 
 #[allow(missing_docs)]
@@ -483,6 +489,10 @@ pub mod tests {
         fn allocate(&self, size: usize) -> Result<NullDeviceStorage, StorageError> {
             Ok(NullDeviceStorage::new(size as u64))
         }
+
+        fn get_storage_type(&self) -> StorageType {
+            StorageType::Null
+        }
     }
 
     #[derive(Debug)]
@@ -523,6 +533,10 @@ pub mod tests {
     impl StorageAllocator<NullHostStorage> for NullHostAllocator {
         fn allocate(&self, size: usize) -> Result<NullHostStorage, StorageError> {
             Ok(NullHostStorage::new(size as u64))
+        }
+
+        fn get_storage_type(&self) -> StorageType {
+            StorageType::Null
         }
     }
 }

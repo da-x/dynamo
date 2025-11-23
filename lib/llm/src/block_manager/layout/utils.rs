@@ -288,9 +288,9 @@ pub fn validate_indices<C: BlockLayoutConfig>(
 #[cfg(test)]
 mod worker_verification_tests {
     use super::*;
-    use crate::block_manager::LayoutConfig;
     use crate::block_manager::layout::{FullyContiguous, LayerSeparate};
     use crate::block_manager::storage::tests::{NullDeviceAllocator, NullDeviceStorage};
+    use crate::block_manager::LayoutConfig;
 
     // Test constants (same as layout.rs tests)
     const NUM_BLOCKS: usize = 7;

@@ -431,6 +431,12 @@ impl StorageAllocator<DiskStorage> for DiskAllocator {
     fn allocate(&self, size: usize) -> Result<DiskStorage, StorageError> {
         DiskStorage::new(size)
     }
+
+    fn get_storage_type(&self) -> StorageType {
+        // Return a representative disk storage type
+        // The actual file descriptor will be set when storage is created
+        StorageType::Disk(0)
+    }
 }
 
 #[cfg(test)]

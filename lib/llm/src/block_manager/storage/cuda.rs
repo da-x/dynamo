@@ -347,6 +347,10 @@ impl StorageAllocator<PinnedStorage> for PinnedAllocator {
     fn allocate(&self, size: usize) -> Result<PinnedStorage, StorageError> {
         PinnedStorage::new(&self.ctx, size)
     }
+
+    fn get_storage_type(&self) -> StorageType {
+        StorageType::Pinned
+    }
 }
 
 /// An enum indicating the type of device storage.
@@ -511,6 +515,10 @@ impl DeviceAllocator {
 impl StorageAllocator<DeviceStorage> for DeviceAllocator {
     fn allocate(&self, size: usize) -> Result<DeviceStorage, StorageError> {
         DeviceStorage::new(&self.ctx, size)
+    }
+
+    fn get_storage_type(&self) -> StorageType {
+        StorageType::Device(self.ctx.cu_device() as u32)
     }
 }
 

@@ -104,6 +104,18 @@ pub mod utils;
 
 use utils::*;
 
+/// Check if two storage types are compatible for use in the same layout
+fn storage_types_compatible(a: &StorageType, b: &StorageType) -> bool {
+    match (a, b) {
+        (StorageType::System, StorageType::System) => true,
+        (StorageType::Device(dev1), StorageType::Device(dev2)) => dev1 == dev2,
+        (StorageType::Pinned, StorageType::Pinned) => true,
+        (StorageType::Disk(_), StorageType::Disk(_)) => true, // Allow different disk file IDs
+        (StorageType::Null, StorageType::Null) => true,
+        _ => false,
+    }
+}
+
 use derive_getters::Getters;
 use thiserror::Error;
 
@@ -377,13 +389,6 @@ impl FullyContiguousConfig {
             layout_data_bytes,
         })
     }
-
-    /// Calculate the total number of bytes required for allocation, including initial alignment padding.
-    /// Panics if the provided configuration is invalid.
-    pub fn required_allocation_size(&self) -> usize {
-        let initial_padding = self.inner.alignment.saturating_sub(1);
-        self.layout_data_bytes + initial_padding
-    }
 }
 
 impl BlockLayoutConfig for FullyContiguousConfig {
@@ -397,81 +402,184 @@ impl BlockLayoutConfig for FullyContiguousConfig {
 }
 
 /// Contiguous memory layout where all blocks and layers are sequential
+/// Now supports multiple storage regions, especially useful for disk storage
 #[derive(Debug)]
 pub struct FullyContiguous<S: Storage> {
     /// Configuration for the layout
     config: FullyContiguousConfig,
 
-    /// Storage for the layoutk
-    storage: S,
+    /// Storage regions for the layout
+    storage_regions: Vec<S>,
 
     /// Storage type for the layout
     storage_type: StorageType,
 
-    // Offset from storage.addr() to the aligned start of block 0
-    base_offset: usize,
+    /// Offsets from each storage.addr() to the aligned start of block 0
+    base_offsets: Vec<usize>,
+
+    /// Number of blocks per storage region (for distributing blocks)
+    full_region_blocks: usize,
+    /// Number of blocks in the last region (may be different)
+    remainder_region_blocks: usize,
 }
 
 impl<S: Storage> FullyContiguous<S> {
+    /// Map a global block ID to a storage region and local block ID
+    /// Uses interleaved distribution similar to v2
+    fn block_id_to_region(&self, block_id: usize) -> (usize, usize) {
+        let num_regions = self.storage_regions.len();
+        let group_size = 4;
+        if num_regions == 1 {
+            return (0, block_id);
+        }
+
+        let nr_full_groups = self.remainder_region_blocks / group_size;
+        let full_groups_height = nr_full_groups * group_size;
+        let reminder_height = self.full_region_blocks - full_groups_height;
+
+        // TODO: Doc
+        let full_n = full_groups_height * num_regions;
+        if block_id < full_n {
+            let group_idx = block_id / group_size;
+            (
+                group_idx % num_regions,
+                (block_id % group_size) + (group_size * (group_idx / num_regions)),
+            )
+        } else {
+            let block_id = block_id - full_n;
+            (
+                block_id / reminder_height,
+                full_groups_height + block_id % reminder_height,
+            )
+        }
+    }
+
+    /// Get the storage region that contains a specific block
+    pub fn storage_region_for_block(&self, block_id: usize) -> Option<&S> {
+        if block_id >= self.config.inner.num_blocks {
+            return None;
+        }
+        let (region_idx, _) = self.block_id_to_region(block_id);
+        self.storage_regions.get(region_idx)
+    }
+
     /// Create a new contiguous layout using the provided configuration and pre-allocated storage.
     /// Performs validation and calculates strides/offsets.
+    /// Now supports multiple storage regions for better distribution of blocks.
     #[instrument(level = "debug", skip(storage), fields(config = ?config))]
-    pub fn new(config: LayoutConfig, mut storage: Vec<S>) -> Result<Self, LayoutError> {
+    pub fn new(config: LayoutConfig, storage: Vec<S>) -> Result<Self, LayoutError> {
         // Calculate dimensions, which includes validation.
         let config = FullyContiguousConfig::new(config)?;
 
-        if storage.len() != 1 {
+        if storage.is_empty() {
             return Err(LayoutError::InvalidConfig(
-                "FullyContiguous layout requires exactly one storage region".to_string(),
+                "FullyContiguous layout requires at least one storage region".to_string(),
             ));
         }
-        let storage = storage.remove(0);
-        let storage_type = storage.storage_type();
 
-        let base_offset = validate_storage(&storage, &config)?;
+        let storage_type = storage[0].storage_type();
+
+        // Validate all storage regions have compatible types
+        for s in &storage {
+            if !storage_types_compatible(&storage_type, &s.storage_type()) {
+                return Err(LayoutError::InvalidConfig(format!(
+                    "All storage regions must have compatible types: found {:?} and {:?}",
+                    storage_type,
+                    s.storage_type()
+                )));
+            }
+        }
+
+        // Calculate block distribution across storage regions
+        let num_regions = storage.len();
+        let full_region_blocks = config.inner.num_blocks / num_regions;
+        let remainder_region_blocks =
+            config.inner.num_blocks - full_region_blocks * (num_regions - 1);
+
+        let mut base_offsets = Vec::with_capacity(num_regions);
+        for (region_idx, s) in storage.iter().enumerate() {
+            // Calculate base offset for alignment
+            let base_offset = if config.inner.alignment > 1 {
+                let addr = s.addr() as usize;
+                let aligned_addr = align_up(addr, config.inner.alignment);
+                aligned_addr - addr
+            } else {
+                0
+            };
+
+            // Calculate how many blocks this region needs to hold
+            let blocks_in_region = if region_idx + 1 < num_regions {
+                full_region_blocks
+            } else {
+                remainder_region_blocks
+            };
+
+            // Validate this region has enough space
+            let region_data_bytes = blocks_in_region
+                .saturating_sub(1)
+                .saturating_mul(config.block_stride_in_bytes)
+                + config.natural_block_stride;
+            let required_size = region_data_bytes + base_offset;
+            if s.size() < required_size {
+                return Err(LayoutError::InvalidConfig(format!(
+                    "Storage region {} too small: has {} bytes, needs {} bytes (for {} blocks)",
+                    region_idx,
+                    s.size(),
+                    required_size,
+                    blocks_in_region
+                )));
+            }
+
+            base_offsets.push(base_offset);
+        }
 
         tracing::debug!(
+            num_regions,
+            full_region_blocks,
+            remainder_region_blocks,
             config.memory_region_size,
             config.layer_stride_in_bytes,
             config.block_stride_in_bytes,
             config.natural_block_stride,
             alignment = config.inner.alignment,
-            base_offset,
-            "Calculated layout strides (aligned)"
+            "Calculated layout strides for multiple storage regions"
         );
 
         Ok(Self {
             config,
-            storage,
+            storage_regions: storage,
             storage_type,
-            base_offset,
+            base_offsets,
+            full_region_blocks,
+            remainder_region_blocks,
         })
     }
 
     /// Internal constructor used for reconstruction from serialized parts.
-    /// Assumes the provided config, storage, and base_offset are consistent
+    /// Assumes the provided config, storage, and base_offsets are consistent
     /// and skips size/alignment validation against the storage.
     pub(crate) fn new_internal(
         config: FullyContiguousConfig,
-        storage: S,
+        storage_regions: Vec<S>,
         storage_type: StorageType,
-        base_offset: usize,
+        base_offsets: Vec<usize>,
+        full_region_blocks: usize,
+        remainder_region_blocks: usize,
     ) -> Result<Self, LayoutError> {
-        // Basic check: Ensure the storage address matches expectations based on offset if possible?
-        // Maybe not strictly necessary if we trust the serialized data.
         Ok(Self {
             config,
-            storage,
+            storage_regions,
             storage_type,
-            base_offset,
+            base_offsets,
+            full_region_blocks,
+            remainder_region_blocks,
         })
     }
 
     /// Allocate storage using the provided allocator and create a new FullyContiguous layout.
     ///
-    /// Calculates the required size based on the configuration, allocates the storage
-    /// (including potential padding for initial alignment), and then constructs the
-    /// `FullyContiguous` layout instance.
+    /// For disk storage, creates multiple files to distribute blocks. For other storage types,
+    /// uses a single allocation for backward compatibility.
     ///
     /// # Type Parameters
     ///
@@ -491,27 +599,64 @@ impl<S: Storage> FullyContiguous<S> {
         config: LayoutConfig,
         allocator: &dyn StorageAllocator<S>,
     ) -> Result<Self, LayoutError> {
-        // Calculate total bytes needed. Propagate error if config is invalid.
-        let config = FullyContiguousConfig::new(config)?;
-        let bytes_to_allocate = config.required_allocation_size();
+        // Calculate the configuration
+        let fc_config = FullyContiguousConfig::new(config)?;
 
-        tracing::debug!(
-            bytes_to_allocate,
-            alignment = config.inner.alignment,
-            "Calculated storage size for allocation (with alignment padding)"
-        );
+        let max_regions = match allocator.get_storage_type() {
+            StorageType::Disk(_) => 64, // Use multiple files for disk storage like v2
+            _ => 1,                     // Single allocation for other storage types
+        };
+        let num_regions = max_regions.min(fc_config.inner.num_blocks);
 
-        let storage = allocator.allocate(bytes_to_allocate).map_err(|e| {
-            LayoutError::OperationFailed(format!("Storage allocation failed: {}", e))
-        })?;
-        tracing::debug!(
-            allocated_size = storage.size(),
-            allocated_addr = storage.addr(),
-            "Storage allocated successfully"
-        );
+        // Calculate block distribution
+        let full_region_blocks = fc_config.inner.num_blocks / num_regions;
+        let remainder_region_blocks =
+            fc_config.inner.num_blocks - full_region_blocks * (num_regions - 1);
 
-        // Pass the config by value as Self::new takes ownership
-        Self::new(config.inner, vec![storage])
+        let mut storage_regions = Vec::with_capacity(num_regions);
+
+        // Allocate storage for each region
+        for i in 0..num_regions {
+            let blocks_in_this_region = if i + 1 < num_regions {
+                full_region_blocks
+            } else {
+                remainder_region_blocks
+            };
+
+            // Calculate required size for this region
+            let region_data_bytes = blocks_in_this_region
+                .saturating_sub(1)
+                .saturating_mul(fc_config.block_stride_in_bytes)
+                + fc_config.natural_block_stride;
+            let bytes_to_allocate = region_data_bytes + fc_config.inner.alignment.saturating_sub(1);
+
+            tracing::debug!(
+                region = i,
+                blocks_in_this_region,
+                bytes_to_allocate,
+                alignment = fc_config.inner.alignment,
+                "Allocating storage region"
+            );
+
+            let storage = allocator.allocate(bytes_to_allocate).map_err(|e| {
+                LayoutError::OperationFailed(format!(
+                    "Storage allocation failed for region {}: {}",
+                    i, e
+                ))
+            })?;
+
+            tracing::debug!(
+                region = i,
+                allocated_size = storage.size(),
+                allocated_addr = storage.addr(),
+                "Storage region allocated successfully"
+            );
+
+            storage_regions.push(storage);
+        }
+
+        // Create the layout
+        Self::new(fc_config.inner, storage_regions)
     }
 }
 
@@ -523,11 +668,11 @@ impl<S: Storage> BlockLayout for FullyContiguous<S> {
     }
 
     fn storage(&self) -> Vec<&Self::StorageType> {
-        vec![&self.storage]
+        self.storage_regions.iter().collect()
     }
 
     fn storage_mut(&mut self) -> Vec<&mut Self::StorageType> {
-        vec![&mut self.storage]
+        self.storage_regions.iter_mut().collect()
     }
 }
 
@@ -548,11 +693,15 @@ impl<S: Storage> GenericBlockLayout for FullyContiguous<S> {
     ) -> Result<LocalMemoryRegion, LayoutError> {
         validate_indices(&self.config, block_idx, layer_idx, outer_idx)?;
 
-        // Start from the aligned base address
-        let aligned_start_addr = self.storage.addr() as usize + self.base_offset;
+        // Determine which storage region this block belongs to
+        let (region_idx, local_block_id) = self.block_id_to_region(block_idx);
+
+        // Start from the aligned base address of the selected storage region
+        let aligned_start_addr =
+            self.storage_regions[region_idx].addr() as usize + self.base_offsets[region_idx];
 
         // Calculate offset relative to the aligned start using stored config
-        let block_offset = block_idx * self.config.block_stride_in_bytes;
+        let block_offset = local_block_id * self.config.block_stride_in_bytes;
         let layer_offset = layer_idx * self.config.layer_stride_in_bytes;
         let outer_offset = outer_idx * self.config.outer_dim_stride_in_bytes;
         let final_addr = aligned_start_addr + block_offset + layer_offset + outer_offset;
@@ -560,7 +709,7 @@ impl<S: Storage> GenericBlockLayout for FullyContiguous<S> {
         Ok(LocalMemoryRegion {
             addr: final_addr,
             size: self.config.memory_region_size,
-            storage_type: self.storage_type,
+            storage_type: self.storage_regions[region_idx].storage_type(),
         })
     }
 }
@@ -610,8 +759,11 @@ impl<S: Storage> FullyContiguous<S> {
     ) -> Result<usize, LayoutError> {
         validate_indices(&self.config, block_idx, layer_idx, outer_idx)?;
 
-        let aligned_start_addr = self.storage.addr() as usize + self.base_offset;
-        let block_offset = block_idx * self.config.block_stride_in_bytes;
+        let (region_idx, local_block_id) = self.block_id_to_region(block_idx);
+
+        let aligned_start_addr =
+            self.storage_regions[region_idx].addr() as usize + self.base_offsets[region_idx];
+        let block_offset = local_block_id * self.config.block_stride_in_bytes;
         let layer_offset = layer_idx * self.config.layer_stride_in_bytes;
         let outer_offset = outer_idx * self.config.outer_dim_stride_in_bytes;
 
@@ -1089,9 +1241,13 @@ pub mod tests {
             alignment: 1,
             dtype_width_bytes: DTYPE_WIDTH_BYTES,
         };
-        // Calculate correct size needed
+        // Calculate correct size needed: data_size + alignment padding
         let fc_config = FullyContiguousConfig::new(config.clone()).unwrap();
-        let required_size = fc_config.required_allocation_size();
+        let natural_block_stride = fc_config.natural_block_stride;
+        let aligned_block_stride = fc_config.block_stride_in_bytes;
+        let data_size =
+            (fc_config.inner.num_blocks - 1) * aligned_block_stride + natural_block_stride;
+        let required_size = data_size + fc_config.inner.alignment.saturating_sub(1);
         let storage = NullDeviceStorage::new((required_size - 1) as u64);
         let layout_result = FullyContiguous::new(config, vec![storage]);
 
@@ -1120,7 +1276,7 @@ pub mod tests {
         let dims = layout.config.clone();
         let block_stride = dims.block_stride_in_bytes;
         let layer_stride = dims.layer_stride_in_bytes;
-        let base_addr = layout.storage.addr() + layout.base_offset as u64;
+        let base_addr = layout.storage_regions[0].addr() + layout.base_offsets[0] as u64;
 
         // Test first block, first layer
         let expected_offset_0_0 =
@@ -1240,14 +1396,14 @@ pub mod tests {
         assert_eq!(layout.num_layers(), NUM_LAYERS);
         assert_eq!(layout.page_size(), PAGE_SIZE);
         assert_eq!(layout.inner_dim(), INNER_DIM);
-        assert_eq!(layout.storage.storage_type(), StorageType::System);
         assert_eq!(
-            layout.storage.size(),
-            layout.config.required_allocation_size()
+            layout.storage().first().unwrap().storage_type(),
+            StorageType::System
         );
-
+        // With single region, total size = sum of all region sizes
+        let total_size: usize = layout.storage_regions.iter().map(|s| s.size()).sum();
         assert_eq!(
-            layout.storage.size(),
+            total_size,
             NUM_BLOCKS * NUM_LAYERS * OUTER_DIM * PAGE_SIZE * INNER_DIM * DTYPE_WIDTH_BYTES
         );
     }
@@ -1277,10 +1433,6 @@ pub mod tests {
         let aligned_block_stride = align_up(natural_block_stride, ALIGNMENT);
         assert_eq!(aligned_block_stride, 2304);
 
-        // Calculate the expected *allocated* size (data + initial padding)
-        let fc_config = FullyContiguousConfig::new(config.clone()).unwrap();
-        let expected_allocated_size = fc_config.required_allocation_size();
-
         // Use allocate method
         let allocator = SystemAllocator;
         let layout_result = FullyContiguous::allocate(config.clone(), &allocator);
@@ -1293,9 +1445,15 @@ pub mod tests {
         let layout = layout_result.unwrap();
 
         // Verify total *allocated* size matches expectation
+        // With alignment, total = data_size + (alignment - 1) for single region
+        let memory_region_size = PAGE_SIZE * INNER_DIM * DTYPE_WIDTH_BYTES;
+        let natural_block_stride = OUTER_DIM * NUM_LAYERS * memory_region_size;
+        let aligned_block_stride = align_up(natural_block_stride, ALIGNMENT);
+        let data_size = (NUM_BLOCKS - 1) * aligned_block_stride + natural_block_stride;
+        let expected_allocated_size = data_size + ALIGNMENT - 1;
+        let total_size: usize = layout.storage_regions.iter().map(|s| s.size()).sum();
         assert_eq!(
-            layout.storage.size(),
-            expected_allocated_size,
+            total_size, expected_allocated_size,
             "Allocated storage size mismatch"
         );
         assert_eq!(

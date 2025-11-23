@@ -99,8 +99,8 @@ use super::{
 };
 
 use super::super::storage::{
-    Storage, StorageAllocator,
     nixl::{NixlAgent, NixlRegisterableStorage, NixlStorage, OptArgs},
+    Storage, StorageAllocator,
 };
 use super::{FullyContiguous, FullyContiguousConfig, LayerSeparate, LayerSeparateConfig};
 use serde::{Deserialize, Serialize};
@@ -240,22 +240,15 @@ impl<S: NixlRegisterableStorage> ToSerializedNixlBlockLayout for FullyContiguous
     fn serialize(&self) -> Result<SerializedNixlBlockLayout, LayoutError> {
         // Use accessors added previously
         let config = self.config.clone();
-        let base_offset = self.base_offset;
+        let base_offsets = self.base_offsets.clone();
 
         let storages = self.storage();
-
-        if storages.len() != 1 {
-            return Err(LayoutError::InvalidConfig(
-                "FullyContiguous reconstruction expects exactly one NixlStorage descriptor"
-                    .to_string(),
-            ));
-        }
 
         let storage_descriptors = serialize_storages(storages)?;
 
         let serializable_data = SerializableNixlLayout::new(
             config,
-            vec![base_offset],
+            base_offsets,
             storage_descriptors,
             *self.storage_type(),
         );
@@ -308,15 +301,24 @@ impl SerializedNixlBlockLayout {
                             .to_string(),
                     ));
                 }
-                // Clone the single NixlStorage descriptor to become the storage instance
-                let storage = config.storage_descriptors[0].clone();
+                // Clone the storage descriptors to become the storage instances
+                let storage_regions = config.storage_descriptors.clone();
+
+                // Calculate block distribution for reconstruction
+                let num_regions = storage_regions.len();
+                let full_region_blocks =
+                    (config.config.num_blocks() + num_regions - 1) / num_regions;
+                let remainder_region_blocks =
+                    config.config.num_blocks() - full_region_blocks * (num_regions - 1);
 
                 // Use the internal constructor which skips allocation checks
                 let layout = FullyContiguous::new_internal(
                     config.config.clone(),
-                    storage, // Pass the NixlStorage instance
+                    storage_regions,
                     config.storage_type,
-                    config.base_offsets[0],
+                    config.base_offsets,
+                    full_region_blocks,
+                    remainder_region_blocks,
                 )?;
                 Ok(Arc::new(layout))
             }

@@ -145,6 +145,14 @@ git checkout $VLLM_REF
 echo "✓ vLLM repository cloned"
 
 
+echo "\n=== Applying vLLM patches ==="
+if [ -f /tmp/deps/vllm/patch-vllm.sh ]; then
+    bash /tmp/deps/vllm/patch-vllm.sh
+    echo "  vLLM patches applied"
+else
+    echo "  No patch script found, skipping"
+fi
+
 echo "\n=== Installing vLLM & FlashInfer ==="
 
 # Build GitHub release wheel URL per CUDA version
